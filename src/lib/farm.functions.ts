@@ -5,6 +5,31 @@ import { buildFertilizerPlan, CROPS, currentSeason, recommendCrops, type FarmPro
 
 const GEMINI_MODELS = ['gemini-3.8-flash', 'gemini-3.6-flash', 'gemini-3.5-flash-lite'] as const
 
+function normalizeLocation(value: string): string {
+  return value
+    .replace(/\b(district|dist\.?)\b/gi, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+/**
+ * Strictly parses AGMARKNET DD/MM/YYYY or DD-MM-YYYY dates BEFORE falling back to ISO/Date.parse
+ * so "05/11/2026" is never misread as May 11 instead of 5 November.
+ */
+function parseAgmarknetDate(value: string): number {
+  const trimmed = value.trim()
+  const dmy = /^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$/.exec(trimmed)
+  if (dmy) {
+    const day = Number(dmy[1])
+    const month = Number(dmy[2])
+    const year = Number(dmy[3])
+    const ts = new Date(year, month - 1, day).getTime()
+    return Number.isFinite(ts) ? ts : 0
+  }
+  const iso = Date.parse(trimmed)
+  return Number.isFinite(iso) ? iso : 0
+}
+
 async function callGeminiWithFallback(
   apiKey: string,
   payload: Record<string, unknown>,
@@ -287,8 +312,9 @@ export const reverseGeocode = createServerFn({ method: 'POST' })
       const a = json.address ?? {}
       const pick = (...keys: string[]) => keys.map((k) => a[k]).find((v) => typeof v === 'string' && v) ?? ''
       const village = pick('village', 'hamlet', 'locality', 'town', 'city', 'municipality', 'suburb', 'neighbourhood')
-      const district = pick('state_district', 'district', 'county')
-      return { village, district, state: pick('state'), displayName: json.display_name ?? '', error: '' }
+      const district = normalizeLocation(pick('state_district', 'district', 'county'))
+      const state = normalizeLocation(pick('state'))
+      return { village, district, state, displayName: json.display_name ?? '', error: '' }
     } catch {
       return {
         error: 'Unable to look up this location right now. Please enter the village and district manually.',
@@ -299,7 +325,6 @@ export const reverseGeocode = createServerFn({ method: 'POST' })
     }
   })
 
-
 /* ---------- Live mandi prices (data.gov.in / AGMARKNET) ---------- */
 
 const mandiInput = z.object({
@@ -308,13 +333,20 @@ const mandiInput = z.object({
   crops: z.array(z.string().trim().min(1).max(60)).min(1).max(10),
 })
 
-type MandiQuote = { crop: string; price: number | null; market: string | null; arrivalDate: string | null; source: string; note?: string }
+export type MandiQuote = {
+  crop: string
+  price: number | null
+  market: string | null
+  arrivalDate: string | null
+  source: string
+  note?: string
+}
 
 export const getMandiPrices = createServerFn({ method: 'POST' })
   .middleware([requireSupabaseAuth])
   .inputValidator((input) => mandiInput.parse(input))
   .handler(async ({ data }): Promise<{ quotes: MandiQuote[]; live: boolean; message: string }> => {
-    const apiKey = process.env['DATA_GOV_IN_API_KEY']
+    const apiKey = process.env['DATA_GOV_IN_API_KEY']?.trim()
     if (!apiKey) {
       return {
         quotes: data.crops.map((crop) => ({ crop, price: null, market: null, arrivalDate: null, source: 'data.gov.in' })),
@@ -322,46 +354,120 @@ export const getMandiPrices = createServerFn({ method: 'POST' })
         message: 'Live mandi prices need DATA_GOV_IN_API_KEY in the server environment. Crop fit is still calculated from your farm profile.',
       }
     }
-    const state = data.state || process.env['MANDI_STATE'] || 'Maharashtra'
-    const resource = process.env['DATA_GOV_IN_MANDI_RESOURCE_ID'] || '9ef84268-d588-465a-a308-a864a43d0070'
-    const quotes = await Promise.all(data.crops.map(async (crop): Promise<MandiQuote> => {
-      try {
-        const url = new URL(`https://api.data.gov.in/resource/${resource}`)
-        url.searchParams.set('api-key', apiKey)
-        url.searchParams.set('format', 'json')
-        url.searchParams.set('limit', '20')
-        url.searchParams.set('filters[state]', state)
-        url.searchParams.set('filters[district]', data.district)
-        url.searchParams.set('filters[commodity]', crop)
-        const response = await fetch(url, { signal: AbortSignal.timeout(9000), headers: { Accept: 'application/json' } })
-        if (!response.ok) return { crop, price: null, market: null, arrivalDate: null, source: 'data.gov.in', note: `Mandi service returned ${response.status}` }
-        const body = await response.json() as { records?: Array<Record<string, unknown>> }
-        const records = body.records ?? []
-        const valid = records.map((r) => ({
-          price: Number(r.modal_price ?? r.modalprice ?? r.modalPrice),
-          market: String(r.market ?? r.market_name ?? ''),
-          arrivalDate: String(r.arrival_date ?? r.arrivalDate ?? ''),
-        })).filter((r) => Number.isFinite(r.price) && r.price > 0)
-        const arrivalTimestamp = (value: string) => {
-          const parsed = Date.parse(value)
-          if (Number.isFinite(parsed)) return parsed
-          const parts = value.split(/[/-]/).map(Number)
-          if (parts.length === 3) {
-            const [day, month, year] = parts
-            return new Date(year!, month! - 1, day!).getTime()
-          }
-          return 0
-        }
-        valid.sort((a, b) => arrivalTimestamp(b.arrivalDate) - arrivalTimestamp(a.arrivalDate))
-        const latest = valid[0]
-        return { crop, price: latest?.price ?? null, market: latest?.market || null, arrivalDate: latest?.arrivalDate || null, source: 'AGMARKNET via data.gov.in', ...(!latest ? { note: 'No matching district-market quote was returned.' } : {}) }
-      } catch {
-        return { crop, price: null, market: null, arrivalDate: null, source: 'data.gov.in', note: 'Mandi service unavailable; retry later.' }
-      }
-    }))
-    return { quotes, live: quotes.some((q) => q.price !== null), message: 'Prices are the latest matching market quotes returned by AGMARKNET; availability varies by district and commodity.' }
-  })
 
+    const state = normalizeLocation(data.state || process.env['MANDI_STATE'] || 'Maharashtra')
+    const district = normalizeLocation(data.district)
+    const resource = process.env['DATA_GOV_IN_MANDI_RESOURCE_ID'] || '9ef84268-d588-465a-a308-a864a43d0070'
+
+    const quotes = await Promise.all(
+      data.crops.map(async (crop): Promise<MandiQuote> => {
+        try {
+          const allRecords: Array<{ price: number; market: string; arrivalDate: string }> = []
+          const pageSize = 500
+          const maxPages = 6
+
+          for (let page = 0; page < maxPages; page++) {
+            const url = new URL(`https://api.data.gov.in/resource/${resource}`)
+            url.searchParams.set('api-key', apiKey)
+            url.searchParams.set('format', 'json')
+            url.searchParams.set('limit', String(pageSize))
+            url.searchParams.set('offset', String(page * pageSize))
+            url.searchParams.set('filters[state]', state)
+            url.searchParams.set('filters[district]', district)
+            url.searchParams.set('filters[commodity]', crop)
+
+            const response = await fetch(url, {
+              signal: AbortSignal.timeout(9000),
+              headers: { Accept: 'application/json' },
+            })
+
+            if (!response.ok) {
+              if (page === 0) {
+                return {
+                  crop,
+                  price: null,
+                  market: null,
+                  arrivalDate: null,
+                  source: 'data.gov.in',
+                  note: `Mandi service returned ${response.status}`,
+                }
+              }
+              break
+            }
+
+            const body = (await response.json()) as {
+              total?: number
+              records?: Array<Record<string, unknown>>
+            }
+            const rawRecords = body.records ?? []
+
+            for (const r of rawRecords) {
+              const price = Number(r.modal_price ?? r.modalprice ?? r.modalPrice)
+              if (Number.isFinite(price) && price > 0) {
+                allRecords.push({
+                  price,
+                  market: String(r.market ?? r.market_name ?? '').trim(),
+                  arrivalDate: String(r.arrival_date ?? r.arrivalDate ?? '').trim(),
+                })
+              }
+            }
+
+            if (rawRecords.length < pageSize || (typeof body.total === 'number' && (page + 1) * pageSize >= body.total)) {
+              break
+            }
+          }
+
+          if (allRecords.length === 0) {
+            return {
+              crop,
+              price: null,
+              market: null,
+              arrivalDate: null,
+              source: 'AGMARKNET via data.gov.in',
+              note: `No matching district-market quote was returned for ${crop} in ${district}, ${state}.`,
+            }
+          }
+
+          allRecords.sort((a, b) => parseAgmarknetDate(b.arrivalDate) - parseAgmarknetDate(a.arrivalDate))
+
+          const latestTs = parseAgmarknetDate(allRecords[0]!.arrivalDate)
+          const latestDayRecords = allRecords.filter((r) => parseAgmarknetDate(r.arrivalDate) === latestTs)
+
+          const avgPrice = Math.round(
+            latestDayRecords.reduce((sum, r) => sum + r.price, 0) / latestDayRecords.length,
+          )
+          const uniqueMarkets = Array.from(new Set(latestDayRecords.map((r) => r.market).filter(Boolean)))
+          const marketLabel =
+            uniqueMarkets.length > 1
+              ? `${uniqueMarkets[0]} (+${uniqueMarkets.length - 1} mandis)`
+              : uniqueMarkets[0] || null
+
+          return {
+            crop,
+            price: avgPrice,
+            market: marketLabel,
+            arrivalDate: latestDayRecords[0]!.arrivalDate || null,
+            source: 'AGMARKNET via data.gov.in',
+          }
+        } catch {
+          return {
+            crop,
+            price: null,
+            market: null,
+            arrivalDate: null,
+            source: 'data.gov.in',
+            note: 'Mandi service unavailable; retry later.',
+          }
+        }
+      }),
+    )
+
+    return {
+      quotes,
+      live: quotes.some((q) => q.price !== null),
+      message: 'Prices are the latest matching market quotes returned by AGMARKNET; availability varies by district and commodity.',
+    }
+  })
 
 /* ---------- Account-backed crop advice and crop validation ---------- */
 
